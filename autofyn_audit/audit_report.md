@@ -9,9 +9,9 @@
 
 ## Executive Summary
 
-This report presents the findings of a source-level and dynamic security audit of the RAGFlow codebase. Nine independent, critical-to-high severity vulnerabilities were identified, each confirmed with a working proof-of-concept exploit script. The vulnerabilities span authentication, serialization, access control, server-side request forgery, and container security — multiple attack paths lead to remote code execution (RCE) without elevated privilege.
+This report presents the findings of a source-level and dynamic security audit of the RAGFlow codebase. Twelve independent, critical-to-high severity vulnerabilities were identified, each confirmed with a working proof-of-concept exploit script. The vulnerabilities span authentication, serialization, access control, server-side request forgery, container security, SQL injection, cross-site scripting, and unsafe template rendering — multiple attack paths lead to remote code execution (RCE) without elevated privilege.
 
-The most severe findings are three distinct RCE vectors (findings 2, 4, and a component of finding 1) that can be triggered by any attacker who obtains write access to the MySQL database, which itself uses default credentials committed to the repository. Findings 6 and 9 are additionally CRITICAL: finding 6 allows unauthenticated file write to any user's storage bucket, and finding 9 combines a security checker bypass with a privileged container configuration that enables Docker host escape.
+The most severe findings are three distinct RCE vectors (findings 2, 4, and a component of finding 1) that can be triggered by any attacker who obtains write access to the MySQL database, which itself uses default credentials committed to the repository. Findings 6 and 9 are additionally CRITICAL: finding 6 allows unauthenticated file write to any user's storage bucket, and finding 9 combines a security checker bypass with a privileged container configuration that enables Docker host escape. Finding 10 reveals a CRITICAL SQL injection in the ExeSQL agent tool where user chat messages flow directly into `cursor.execute()` with trivially bypassable filtering.
 
 ---
 
@@ -37,6 +37,9 @@ The most severe findings are three distinct RCE vectors (findings 2, 4, and a co
 | 7 | Unauthenticated Agent File Download | **HIGH** | Yes | `07_unauth_agent_download.py` |
 | 8 | SSRF via Invoke Component (No URL Validation) | **HIGH** | Yes | `08_ssrf_invoke_component.py` |
 | 9 | Privileged Sandbox Container with Security Checker Bypass | **CRITICAL** | Yes | `09_privileged_sandbox_escape.py` |
+| 10 | SQL Injection in ExeSQL Agent Tool | **CRITICAL** | Yes | `10_exesql_sqli.py` |
+| 11 | Stored XSS via Malicious DOCX Preview | **HIGH** | Yes | `11_stored_xss_docx.py` |
+| 12 | User-Controlled Server-Side Template Rendering | **MEDIUM** | Yes | `12_jinja2_sandbox_bypass.py` |
 
 ---
 
@@ -445,6 +448,149 @@ Expected output: `RESULT: CONFIRMED` — compose config confirms `privileged=tru
 
 ---
 
+### Finding 10: SQL Injection in ExeSQL Agent Tool
+
+**Severity:** CRITICAL (CVSS 9.8 — AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H)
+
+**Affected Component:** `agent/tools/exesql.py`
+
+**Affected Files and Lines:**
+- `agent/tools/exesql.py:42` — default SQL parameter value is `{sys.query}` (user chat message)
+- `agent/tools/exesql.py:258` — DML filter: `re.match(r"^(insert|update|delete)\b", ...)` — trivially bypassed
+- `agent/tools/exesql.py:262` — `cursor.execute(single_sql)` — unsanitized user input
+- `agent/tools/exesql.py:199-239` — IBM DB2 code path returns before the DML filter (zero filtering)
+- `agent/tools/exesql.py:65-69` — internal DB protection bypassable via container IP
+
+**Description:**
+
+The ExeSQL agent tool allows users to execute SQL queries against external databases configured in workflow canvases. The default SQL parameter is literally `{sys.query}`, which resolves to the user's chat message via `string_format()` regex substitution — meaning the user's raw chat input IS the SQL query.
+
+A DML filter at line 258 attempts to block `INSERT`, `UPDATE`, and `DELETE` statements using `re.match(r"^(insert|update|delete)\b", single_sql)`. This filter has multiple critical bypasses:
+
+1. **Leading whitespace**: `" DELETE FROM users"` — the `^` anchor requires position 0, a leading space defeats it
+2. **Unblocked destructive statements**: `DROP TABLE`, `TRUNCATE TABLE`, `ALTER TABLE`, `CREATE TABLE` — none are in the regex
+3. **Data exfiltration**: `SELECT 1 UNION SELECT password FROM users` — `SELECT` is not blocked
+4. **IBM DB2 code path**: The DB2 branch (lines 199-239) calls `ibm_db.exec_immediate(conn, single_sql)` and returns at line 239, before reaching the DML filter at line 258. Zero filtering on this path.
+
+Additionally, the internal database protection (lines 65-69) only checks if `database == "rag_flow"` and then validates `host == "ragflow-mysql"`. An attacker can bypass this by using the container's IP address (e.g., `172.17.0.2`) instead of the hostname.
+
+**Attack Scenario:**
+
+1. Attacker with agent workflow edit access configures an ExeSQL node targeting any database (internal or external).
+2. Attacker sends a chat message containing `DROP TABLE users` or `SELECT * FROM user` — the message becomes the SQL query.
+3. The DML filter does not block the query (DROP is not in the regex).
+4. `cursor.execute()` runs the attacker's SQL with full privileges of the configured database connection.
+5. For internal DB: attacker uses container IP `172.17.0.2` instead of `ragflow-mysql` to bypass the hostname check.
+
+**PoC:** `autofyn_audit/exploits/10_exesql_sqli.py`
+```
+PYTHONPATH=/path/to/repo python autofyn_audit/exploits/10_exesql_sqli.py
+```
+Expected output: `RESULT: CONFIRMED`
+
+**Remediation:**
+
+1. Use parameterized queries (`cursor.execute(sql, params)`) instead of string interpolation for all SQL execution.
+2. Implement a proper SQL statement allowlist — only permit `SELECT` statements, blocking all DDL and DML.
+3. Apply the filter to ALL code paths, including IBM DB2, before execution.
+4. Fix the internal DB protection to check by resolved IP address, not just hostname.
+5. Consider removing direct SQL execution entirely — use a read-only database connection for ExeSQL.
+
+---
+
+### Finding 11: Stored XSS via Malicious DOCX Preview
+
+**Severity:** HIGH (CVSS 7.1 — AV:N/AC:L/PR:L/UI:R/S:U/C:H/I:L/A:N)
+
+**Affected Component:** `web/src/components/document-preview/doc-preview.tsx`, `web/src/components/document-preview/hooks.ts`
+
+**Affected Files and Lines:**
+- `web/src/components/document-preview/doc-preview.tsx:131` — `dangerouslySetInnerHTML={{ __html: htmlContent }}` without DOMPurify
+- `web/src/components/document-preview/doc-preview.tsx:94-103` — mammoth output flows to `htmlContent` with no sanitization
+- `web/src/components/document-preview/hooks.ts:148-151` — second unsanitized sink: `container.innerHTML = result.value`
+
+**Description:**
+
+The DOCX document preview component converts `.docx` files to HTML using the mammoth library, then renders the output using React's `dangerouslySetInnerHTML` without any sanitization. The data flow is:
+
+```
+mammoth.convertToHtml(arrayBuffer) → result.value → styledContent (CSS class regex only) → setHtmlContent() → dangerouslySetInnerHTML={{ __html: htmlContent }}
+```
+
+The `styledContent` transformation at lines 94-103 only performs CSS class name replacements — it applies no XSS filtering.
+
+A second unsanitized sink exists in `hooks.ts:148-151` where `useFetchDocx()` assigns mammoth output directly to `container.innerHTML`.
+
+Critically, **10 other components** in the same codebase use `DOMPurify.sanitize()` before `dangerouslySetInnerHTML` — including `markdown-content`, `next-markdown-content`, `chunk-card`, and `floating-chat-widget-markdown`. This proves the project is aware of the XSS pattern and deliberately applies DOMPurify elsewhere but missed this component.
+
+**Attack Scenario:**
+
+1. Attacker crafts a malicious `.docx` file with embedded content that produces executable HTML through mammoth's conversion (e.g., hyperlinks with `javascript:` URIs, or content exploiting mammoth edge cases).
+2. Attacker uploads the DOCX to a knowledge base.
+3. Victim opens the document preview in their browser.
+4. The unsanitized HTML executes in the victim's browser context — stealing session tokens, performing actions as the victim, or exfiltrating data.
+
+**PoC:** `autofyn_audit/exploits/11_stored_xss_docx.py`
+```
+python autofyn_audit/exploits/11_stored_xss_docx.py
+```
+Expected output: `RESULT: CONFIRMED`
+
+**Remediation:**
+
+1. Add `DOMPurify.sanitize()` to `doc-preview.tsx` before passing HTML to `dangerouslySetInnerHTML`:
+   ```tsx
+   dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(htmlContent) }}
+   ```
+2. Apply the same fix to `hooks.ts:148-151` — sanitize mammoth output before assigning to `innerHTML`.
+3. Add a linter rule to flag any `dangerouslySetInnerHTML` usage without an adjacent `DOMPurify.sanitize()` call.
+
+---
+
+### Finding 12: User-Controlled Server-Side Template Rendering
+
+**Severity:** MEDIUM (CVSS 5.4 — AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:L/A:L)
+
+**Affected Component:** `agent/component/string_transform.py`, `agent/component/message.py`
+
+**Affected Files and Lines:**
+- `agent/component/string_transform.py:21-23` — `SandboxedEnvironment()` instantiated with default config
+- `agent/component/string_transform.py:101` — `_jinja2_sandbox.from_string(script)` renders user template
+- `agent/component/message.py:33-35` — `SandboxedEnvironment()` instantiated with default config
+- `agent/component/message.py:248` — `_jinja2_sandbox.from_string(rand_cnt)` renders user template
+
+**Description:**
+
+Two agent workflow components — `StringTransform` and `Message` — use Jinja2's `SandboxedEnvironment` to render user-authored templates server-side. Users with agent workflow edit access can provide arbitrary Jinja2 template strings that are rendered on the server.
+
+The `SandboxedEnvironment` is instantiated with default configuration — no custom security policy, no restricted attribute list beyond the defaults, and no template variable allowlist. While the default `SandboxedEnvironment` in Jinja2 3.1.6 blocks access to dunder attributes (`__init__`, `__globals__`), this defense relies entirely on the Jinja2 sandbox implementation remaining bypass-free.
+
+Historical context: `SandboxedEnvironment` has had confirmed bypasses (CVE-2019-10906 in Jinja2 < 2.10.1). The sandbox is a denylist-based approach that must be updated for each new bypass technique. Additionally, exceptions from failed template rendering are silently swallowed (line 104 in `string_transform.py`, line 253 in `message.py`), meaning partial bypass attempts produce no log noise.
+
+**Attack Scenario:**
+
+1. Attacker with agent workflow edit access creates a StringTransform or Message component.
+2. Attacker provides a Jinja2 template containing a sandbox bypass payload.
+3. If a bypass exists (current or future), the payload executes with RAGFlow server process privileges.
+4. Silent exception handling means failed bypass attempts leave no audit trail.
+
+**PoC:** `autofyn_audit/exploits/12_jinja2_sandbox_bypass.py`
+```
+PYTHONPATH=/path/to/repo python autofyn_audit/exploits/12_jinja2_sandbox_bypass.py
+```
+Expected output: `RESULT: CONFIRMED (user-controlled SSTR confirmed, current bypasses blocked)`
+
+**Note:** Current known bypass payloads are blocked by Jinja2 3.1.6's default `SandboxedEnvironment`. The confirmed vulnerability is the anti-pattern of rendering user-controlled templates server-side without a custom security policy, which creates an ongoing risk surface.
+
+**Remediation:**
+
+1. Replace `SandboxedEnvironment` with a custom template engine that uses an allowlist of permitted template syntax (e.g., only variable substitution, no filters or method calls).
+2. If Jinja2 must be used, add a custom `SandboxedEnvironment` security policy that restricts accessible attributes and methods to an explicit allowlist.
+3. Log template rendering failures instead of silently swallowing exceptions.
+4. Pin the Jinja2 version and monitor for new sandbox bypass CVEs.
+
+---
+
 ## Infrastructure Notes
 
 Default credentials committed to the repository (`docker/.env`) enable direct database access:
@@ -490,4 +636,9 @@ bash autofyn_audit/teardown.sh  # cleanup
 # Exploits 8-9: standalone, no services needed (code/config analysis only)
 python autofyn_audit/exploits/08_ssrf_invoke_component.py
 python autofyn_audit/exploits/09_privileged_sandbox_escape.py
+
+# Exploits 10-12: standalone code analysis, no services needed
+PYTHONPATH=. python autofyn_audit/exploits/10_exesql_sqli.py
+python autofyn_audit/exploits/11_stored_xss_docx.py
+PYTHONPATH=. python autofyn_audit/exploits/12_jinja2_sandbox_bypass.py
 ```

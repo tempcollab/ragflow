@@ -65,6 +65,11 @@ run_exploit "$EXPLOITS_DIR/07_unauth_agent_download.py"
 run_exploit "$EXPLOITS_DIR/08_ssrf_invoke_component.py"
 run_exploit "$EXPLOITS_DIR/09_privileged_sandbox_escape.py"
 
+# Exploits 10-12: standalone code analysis, no services needed
+run_exploit "$EXPLOITS_DIR/10_exesql_sqli.py"
+run_exploit "$EXPLOITS_DIR/11_stored_xss_docx.py"
+run_exploit "$EXPLOITS_DIR/12_jinja2_sandbox_bypass.py"
+
 echo ""
 echo "============================================================"
 echo "  RESULTS: $PASS confirmed, $FAIL failed"
