@@ -57,6 +57,14 @@ else
     run_exploit "$EXPLOITS_DIR/05_unauth_document_image.py"
 fi
 
+# Exploits 06-07: require RAGFlow server (static analysis confirms without server)
+run_exploit "$EXPLOITS_DIR/06_unauth_agent_upload.py"
+run_exploit "$EXPLOITS_DIR/07_unauth_agent_download.py"
+
+# Exploits 08-09: standalone code/config analysis, no services needed
+run_exploit "$EXPLOITS_DIR/08_ssrf_invoke_component.py"
+run_exploit "$EXPLOITS_DIR/09_privileged_sandbox_escape.py"
+
 echo ""
 echo "============================================================"
 echo "  RESULTS: $PASS confirmed, $FAIL failed"
