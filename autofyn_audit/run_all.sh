@@ -75,6 +75,10 @@ run_exploit "$EXPLOITS_DIR/13_unauth_webhook_execution.py"
 run_exploit "$EXPLOITS_DIR/14_odbc_connstr_injection.py"
 run_exploit "$EXPLOITS_DIR/15_unauth_bulk_thumbnails.py"
 
+# Exploits 16-17: IDOR and cross-tenant injection (static + dynamic)
+run_exploit "$EXPLOITS_DIR/16_idor_tenant_model_update.py"
+run_exploit "$EXPLOITS_DIR/17_cross_tenant_kb_injection.py"
+
 echo ""
 echo "============================================================"
 echo "  RESULTS: $PASS confirmed, $FAIL failed"

@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-This report presents the findings of a source-level and dynamic security audit of the RAGFlow codebase. Fifteen independent, critical-to-high severity vulnerabilities were identified, each confirmed with a working proof-of-concept exploit script. The vulnerabilities span authentication, serialization, access control, server-side request forgery, container security, SQL injection, cross-site scripting, and unsafe template rendering — multiple attack paths lead to remote code execution (RCE) without elevated privilege. Findings 13-15 cover unauthenticated webhook execution, ODBC connection string injection, and unauthenticated bulk thumbnail retrieval.
+This report presents the findings of a source-level and dynamic security audit of the RAGFlow codebase. Seventeen independent, critical-to-high severity vulnerabilities were identified, each confirmed with a working proof-of-concept exploit script. The vulnerabilities span authentication, serialization, access control, server-side request forgery, container security, SQL injection, cross-site scripting, unsafe template rendering, and insecure direct object reference — multiple attack paths lead to remote code execution (RCE) without elevated privilege. Findings 13-15 cover unauthenticated webhook execution, ODBC connection string injection, and unauthenticated bulk thumbnail retrieval. Findings 16-17 cover IDOR in tenant model configuration update and cross-tenant knowledge base document injection.
 
 The most severe findings are three distinct RCE vectors (findings 2, 4, and a component of finding 1) that can be triggered by any attacker who obtains write access to the MySQL database, which itself uses default credentials committed to the repository. Findings 6 and 9 are additionally CRITICAL: finding 6 allows unauthenticated file write to any user's storage bucket, and finding 9 combines a security checker bypass with a privileged container configuration that enables Docker host escape. Finding 10 reveals a CRITICAL SQL injection in the ExeSQL agent tool where user chat messages flow directly into `cursor.execute()` with trivially bypassable filtering.
 
@@ -43,6 +43,8 @@ The most severe findings are three distinct RCE vectors (findings 2, 4, and a co
 | 13 | Unauthenticated Webhook Triggers Full Agent Execution | **HIGH** | Yes | `13_unauth_webhook_execution.py` |
 | 14 | ODBC/CLI Connection String Injection in MSSQL and DB2 | **HIGH** | Yes | `14_odbc_connstr_injection.py` |
 | 15 | Unauthenticated Bulk Document Thumbnail Retrieval | **HIGH** | Yes | `15_unauth_bulk_thumbnails.py` |
+| 16 | IDOR in Tenant LLM Model Configuration Update | **HIGH** | Yes | `16_idor_tenant_model_update.py` |
+| 17 | Cross-Tenant Knowledge Base Document Injection | **HIGH** | Yes | `17_cross_tenant_kb_injection.py` |
 
 ---
 
@@ -708,6 +710,86 @@ Expected output: `RESULT: CONFIRMED (static analysis)` or `RESULT: CONFIRMED (dy
 
 ---
 
+### Finding 16: IDOR in Tenant LLM Model Configuration Update
+
+**Severity:** HIGH (CVSS 7.1 — AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:L)
+
+**Affected Component:** `api/apps/restful_apis/user_api.py`
+
+**Affected Files and Lines:**
+- `api/apps/restful_apis/user_api.py:583-630` — `PATCH /users/me/models` endpoint
+- `api/apps/restful_apis/user_api.py:625` — `tid = req.pop("tenant_id")` — tenant_id from request body
+- `api/apps/restful_apis/user_api.py:627` — `TenantService.update_by_id(tid, update_dict)` — no ownership check
+- `api/db/services/common_service.py:267-277` — `update_by_id()` — updates by ID only, no tenant filter
+- `api/utils/tenant_utils.py:29-37` — `ensure_tenant_model_id_for_params` uses attacker-supplied tenant_id
+
+**Description:**
+
+The `PATCH /api/v1/users/me/models` endpoint is protected by `@login_required` but accepts `tenant_id` from the request body without verifying that the supplied value matches the authenticated user's own tenant. The code extracts `tid = req.pop("tenant_id")` and immediately calls `TenantService.update_by_id(tid, update_dict)`, which issues a `WHERE id == pid` query with no ownership filter. Any authenticated user can supply an arbitrary `tenant_id` and overwrite the target tenant's LLM configuration (`llm_id`, `embd_id`, `asr_id`, `img2txt_id`), breaking or redirecting their RAG pipeline. This is a classic Insecure Direct Object Reference (IDOR) — authentication is present but authorization on the object is absent.
+
+**Attack Scenario:**
+
+1. Attacker registers an account or obtains a valid authentication token (PR:L).
+2. Attacker discovers or guesses a victim's tenant_id (tenant IDs are UUIDs leaked in various API responses).
+3. Attacker sends `PATCH /api/v1/users/me/models` with `{"tenant_id": "<victim_tenant_id>", "llm_id": "attacker-controlled-model", ...}`.
+4. Server executes `TenantService.update_by_id(victim_tenant_id, ...)` without any ownership check.
+5. Victim's LLM/embedding model configuration is overwritten — their RAG pipeline breaks or redirects queries through attacker-controlled model endpoints.
+
+**PoC:**
+
+```bash
+python autofyn_audit/exploits/16_idor_tenant_model_update.py
+```
+
+Expected output: `RESULT: CONFIRMED (static analysis)` or `RESULT: CONFIRMED` when server is live.
+
+**Remediation:**
+
+Replace `tid = req.pop("tenant_id")` with `tid = current_user.id` so the endpoint always operates on the authenticated user's own tenant. Remove `tenant_id` from the request schema entirely — it should never be a client-supplied value.
+
+---
+
+### Finding 17: Cross-Tenant Knowledge Base Document Injection
+
+**Severity:** HIGH (CVSS 7.1 — AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:L)
+
+**Affected Component:** `api/apps/restful_apis/file2document_api.py`
+
+**Affected Files and Lines:**
+- `api/apps/restful_apis/file2document_api.py:76-119` — `POST /files/link-to-datasets` endpoint
+- `api/apps/restful_apis/file2document_api.py:85` — `FileService.get_by_ids(file_ids)` — no tenant parameter
+- `api/apps/restful_apis/file2document_api.py:94-95` — `KnowledgebaseService.get_by_id(kb_id)` — no tenant parameter
+- `api/apps/restful_apis/file2document_api.py:52-68` — `_convert_files` inserts `{"kb_id": kb.id, "created_by": user_id}` — victim KB, attacker user_id
+- `api/db/services/common_service.py:281-293` — `get_by_id()` — queries by ID only, no tenant filter
+- `api/db/services/common_service.py:297-308` — `get_by_ids()` — queries by ID only, no tenant filter
+
+**Description:**
+
+The `POST /api/v1/files/link-to-datasets` endpoint links files to knowledge bases. It is protected by `@login_required` but performs only existence checks on the supplied `file_ids` and `kb_ids` — no tenant ownership verification. `FileService.get_by_ids(file_ids)` and `KnowledgebaseService.get_by_id(kb_id)` both query by ID with no tenant filter, as does the underlying `get_by_id` / `get_by_ids` implementation in `common_service.py`. The `_convert_files()` helper then inserts a new document record with `"kb_id": kb.id` (victim's KB) and `"created_by": user_id` (attacker's user ID), injecting the attacker's file content directly into the victim's knowledge base. Victim's subsequent RAG queries return attacker-controlled poisoned content.
+
+**Attack Scenario:**
+
+1. Attacker registers an account or obtains a valid authentication token (PR:L).
+2. Attacker uploads a malicious file (e.g., containing false information or prompt-injection payloads) and records their file's UUID.
+3. Attacker discovers or enumerates a victim's knowledge base UUID (e.g., via the unauth thumbnail endpoint, or via other IDOR vectors).
+4. Attacker sends `POST /api/v1/files/link-to-datasets` with `{"file_ids": ["<attacker_file_id>"], "kb_ids": ["<victim_kb_id>"]}`.
+5. Server calls `KnowledgebaseService.get_by_id(victim_kb_id)` — no ownership check — then `_convert_files()` inserts a document into the victim's KB.
+6. Victim's users query the compromised KB and receive attacker-controlled responses.
+
+**PoC:**
+
+```bash
+python autofyn_audit/exploits/17_cross_tenant_kb_injection.py
+```
+
+Expected output: `RESULT: CONFIRMED (static analysis)` or `RESULT: CONFIRMED` when server is live.
+
+**Remediation:**
+
+Add tenant ownership checks on both `file_ids` and `kb_ids`: verify that each file and each knowledge base belongs to `current_user`'s tenant before proceeding. Specifically, filter `FileService.get_by_ids()` and `KnowledgebaseService.get_by_id()` to include a `tenant_id == current_user.id` constraint, and reject requests where any supplied ID belongs to a different tenant.
+
+---
+
 ## Infrastructure Notes
 
 Default credentials committed to the repository (`docker/.env`) enable direct database access:
@@ -763,4 +845,8 @@ PYTHONPATH=. python autofyn_audit/exploits/12_jinja2_sandbox_bypass.py
 python autofyn_audit/exploits/13_unauth_webhook_execution.py
 PYTHONPATH=. python autofyn_audit/exploits/14_odbc_connstr_injection.py
 python autofyn_audit/exploits/15_unauth_bulk_thumbnails.py
+
+# Exploits 16-17: IDOR and cross-tenant injection (static + dynamic)
+python autofyn_audit/exploits/16_idor_tenant_model_update.py
+python autofyn_audit/exploits/17_cross_tenant_kb_injection.py
 ```
