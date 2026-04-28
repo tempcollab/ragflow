@@ -12,9 +12,9 @@
 
 ## Executive Summary
 
-This report presents the findings of a source-level and dynamic security audit of the RAGFlow codebase. Sixteen exploitable vulnerabilities and one defense-in-depth recommendation were identified, spanning CRITICAL to MEDIUM severity. All findings were confirmed with working proof-of-concept exploit scripts and verified through live HTTP testing against a running RAGFlow instance. The vulnerabilities span authentication, serialization, access control, server-side request forgery, container security, SQL injection, cross-site scripting, insecure direct object reference, and cross-tenant data isolation.
+This report presents the findings of a source-level and dynamic security audit of the RAGFlow codebase. Sixteen exploitable vulnerabilities and one defense-in-depth recommendation were identified, spanning CRITICAL to MEDIUM severity. All findings were confirmed with working proof-of-concept exploit scripts. Eight findings were additionally validated against a live RAGFlow instance over HTTP; the remaining nine were confirmed through standalone or local code-execution proofs against the exact audited code paths. The vulnerabilities span authentication, serialization, access control, server-side request forgery, container security, SQL injection, cross-site scripting, insecure direct object reference, and cross-tenant data isolation.
 
-The most severe findings are three distinct RCE vectors (findings 2, 4, and a component of finding 1) that can be triggered by any attacker who obtains write access to the MySQL database, which itself uses default credentials committed to the repository. Findings 6 and 9 are additionally CRITICAL: finding 6 allows unauthenticated file write to any user's storage bucket, and finding 9 combines a security checker bypass with a privileged container configuration that enables Docker host escape. Finding 10 reveals a CRITICAL SQL injection in the ExeSQL agent tool where user chat messages flow directly into `cursor.execute()` with trivially bypassable filtering. Finding 16 was confirmed to **succeed** (`code:0`) when updating a different tenant's model configuration — a live-confirmed IDOR. Finding 12 (Jinja2 template rendering) is categorized as a defense-in-depth recommendation: the `SandboxedEnvironment` correctly blocks all known bypass payloads in Jinja2 3.1.6, but the pattern of rendering user-controlled templates server-side creates an ongoing risk surface.
+The most severe findings are three distinct RCE vectors (findings 2, 4, and a component of finding 1) that can be triggered by any attacker who obtains write access to the MySQL database, which itself uses default credentials committed to the repository. Finding 6 was live-confirmed as an unauthenticated file write into another user's storage bucket. Finding 9 remains a serious deployment-level risk where a security-checker bypass is paired with a privileged sandbox configuration and Docker socket access; the exact host-compromise outcome depends on the sandbox profile being enabled in deployment. Finding 10 reveals a CRITICAL SQL injection in the ExeSQL agent tool where user chat messages flow directly into `cursor.execute()` with trivially bypassable filtering. Finding 16 was live-confirmed by mutating a real victim tenant's model configuration from a different authenticated account. Finding 12 (Jinja2 template rendering) is categorized as a defense-in-depth recommendation: the `SandboxedEnvironment` correctly blocks all known bypass payloads in Jinja2 3.1.6, but the pattern of rendering user-controlled templates server-side creates an ongoing risk surface.
 
 ---
 
@@ -24,12 +24,10 @@ The most severe findings are three distinct RCE vectors (findings 2, 4, and a co
 2. Identification of high-risk patterns: unsafe deserialization, cryptographic misuse, missing authentication decorators, dynamic code instantiation, SQL injection, IDOR
 3. Development of self-contained PoC scripts exercising the exact code paths
 4. **Live dynamic confirmation** against an isolated Docker environment using the pinned image (`infiniflow/ragflow@sha256:0698a8...`, v0.25.0-91-gc5116b90e):
-   - Findings 1–4: Standalone PoC scripts — execute locally with no running services, produce proof artifacts
-   - Findings 5–7, 13, 15: HTTP probes comparing authenticated vs unauthenticated endpoints against a live RAGFlow instance
-   - Findings 8–12, 14: Static code/config analysis with live code execution (regex testing, AST parsing, Jinja2 sandbox testing)
-   - Findings 16–17: Authenticated HTTP requests using JWT obtained from the login endpoint — realistic attacker path
+   - Findings 1, 5–7, 13, 15–17: live HTTP requests against a running RAGFlow instance
+   - Findings 2–4, 8–12, 14: standalone or local code-execution proofs against the exact audited code paths
 
-All 17 findings were confirmed: 9 via standalone code execution and 8 via live HTTP requests against the running server. See [Verification Summary](#verification-summary) for detailed live test results.
+All 17 findings were confirmed: 9 via standalone/local code execution and 8 via live HTTP requests against the running server. See [Verification Summary](#verification-summary) for detailed live test results.
 
 ---
 
@@ -41,19 +39,19 @@ All 17 findings were confirmed: 9 via standalone code execution and 8 via live H
 | 2 | Unsafe Pickle Deserialization (RCE) | **CRITICAL** | `02_pickle_deserialization_rce.py` | Standalone (RCE proof file) |
 | 3 | JWT Tokens Never Expire | **HIGH** | `03_jwt_no_expiry.py` | Standalone (token age test) |
 | 4 | Arbitrary Class Instantiation via JSON Hook (RCE) | **HIGH** | `04_from_dict_hook_rce.py` | Standalone (RCE proof file) |
-| 5 | Unauthenticated Document Image Retrieval | **HIGH** | `05_unauth_document_image.py` | Live HTTP (401 vs non-401) |
-| 6 | Unauthenticated Agent File Upload | **CRITICAL** | `06_unauth_agent_upload.py` | Live HTTP (401 vs non-401) |
-| 7 | Unauthenticated Agent File Download | **HIGH** | `07_unauth_agent_download.py` | Live HTTP (401 vs non-401) |
+| 5 | Unauthenticated Document Image Retrieval | **HIGH** | `05_unauth_document_image.py` | Live HTTP (route reachable without auth) |
+| 6 | Unauthenticated Agent File Upload | **CRITICAL** | `06_unauth_agent_upload.py` | Live HTTP (real unauthenticated upload into victim-owned bucket) |
+| 7 | Unauthenticated Agent File Download | **HIGH** | `07_unauth_agent_download.py` | Live HTTP (real unauthenticated file download) |
 | 8 | SSRF via Invoke Component (No URL Validation) | **HIGH** | `08_ssrf_invoke_component.py` | Standalone (AST + grep) |
 | 9 | Privileged Sandbox Container with Security Checker Bypass | **CRITICAL** | `09_privileged_sandbox_escape.py` | Standalone (config + AST bypass) |
 | 10 | SQL Injection in ExeSQL Agent Tool | **CRITICAL** | `10_exesql_sqli.py` | Standalone (regex bypass) |
 | 11 | Stored XSS via Malicious DOCX Preview | **HIGH** | `11_stored_xss_docx.py` | Standalone (source analysis) |
 | 12 | Server-Side Template Rendering (Defense-in-Depth) | **MEDIUM** | `12_jinja2_sandbox_bypass.py` | Standalone (sandbox test) |
-| 13 | Unauthenticated Webhook Triggers Full Agent Execution | **HIGH** | `13_unauth_webhook_execution.py` | Live HTTP (401 vs non-401) |
+| 13 | Unauthenticated Webhook Triggers Full Agent Execution | **HIGH** | `13_unauth_webhook_execution.py` | Live HTTP (real unauthenticated webhook execution) |
 | 14 | ODBC/CLI Connection String Injection in MSSQL and DB2 | **HIGH** | `14_odbc_connstr_injection.py` | Standalone (injection demo) |
-| 15 | Unauthenticated Bulk Document Thumbnail Retrieval | **HIGH** | `15_unauth_bulk_thumbnails.py` | Live HTTP (code:0 no auth) |
-| 16 | IDOR in Tenant LLM Model Configuration Update | **HIGH** | `16_idor_tenant_model_update.py` | Live HTTP (code:0 cross-tenant) |
-| 17 | Cross-Tenant Knowledge Base Document Injection | **HIGH** | `17_cross_tenant_kb_injection.py` | Live HTTP (processed cross-tenant) |
+| 15 | Unauthenticated Bulk Document Thumbnail Retrieval | **HIGH** | `15_unauth_bulk_thumbnails.py` | Live HTTP (real victim doc ID queried without auth) |
+| 16 | IDOR in Tenant LLM Model Configuration Update | **HIGH** | `16_idor_tenant_model_update.py` | Live HTTP (real victim tenant mutated cross-tenant) |
+| 17 | Cross-Tenant Knowledge Base Document Injection | **HIGH** | `17_cross_tenant_kb_injection.py` | Live HTTP (real attacker file injected into victim dataset) |
 
 ---
 
@@ -114,7 +112,7 @@ Expected output: `RESULT: CONFIRMED`
 
 **Description:**
 
-`deserialize_b64()` deserializes data from LONGTEXT database columns using `pickle.loads()`. A `RestrictedUnpickler` exists but is disabled: the guard condition `get_base_config('use_deserialize_safe_module', False)` defaults to `False` and the configuration key is set nowhere in the codebase. `pickle.loads()` on attacker-controlled data is a well-known, trivially exploitable RCE vector.
+`deserialize_b64()` deserializes data from LONGTEXT database columns using `pickle.loads()`. A `RestrictedUnpickler` exists but is disabled: the guard condition `get_base_config('use_deserialize_safe_module', False)` defaults to `False` and the configuration key is set nowhere in the codebase. `pickle.loads()` on attacker-controlled data is a well-known RCE primitive, and the standalone PoC in this audit exercises the exact deserialization path used by the application.
 
 The MySQL database uses default credentials `root/infini_rag_flow` (committed in `docker/.env`), making write access to any table trivially achievable from the network.
 
@@ -403,7 +401,7 @@ Expected output: `RESULT: CONFIRMED` — static code analysis confirms zero SSRF
 
 **Description:**
 
-This finding combines two compounding vulnerabilities:
+This finding combines two compounding issues that materially weaken the sandbox boundary:
 
 **Part A — Dangerous container configuration:**
 The `sandbox-executor-manager` service (controlled by the `sandbox` Docker Compose profile, so opt-in) is configured with:
@@ -411,7 +409,7 @@ The `sandbox-executor-manager` service (controlled by the `sandbox` Docker Compo
 - `/var/run/docker.sock:/var/run/docker.sock` volume mount — gives the container full control over the Docker daemon, enabling launch of arbitrary privileged containers on the host
 - `SANDBOX_ENABLE_SECCOMP=false` (default) — disables Linux seccomp syscall filtering, removing the primary kernel attack surface mitigation
 
-Even though the sandbox profile is opt-in, once enabled the default configuration provides no meaningful containment boundary.
+Even though the sandbox profile is opt-in, once enabled the default configuration provides very weak containment.
 
 **Part B — Security checker bypass:**
 `SecurePythonAnalyzer.visit_Call` (line 78) contains a critical logic error:
@@ -433,7 +431,7 @@ The bypass payload `__builtins__["__import__"]("os").system("id")` passes the an
 2. The security checker approves the code as safe (`is_safe=True`).
 3. The code executes inside the sandbox container, gaining OS-level access.
 4. From within the privileged container with Docker socket access, attacker spawns a new container mounting the host filesystem: `docker run -v /:/host --rm alpine chroot /host sh`
-5. Attacker has full read/write access to the Docker host filesystem — complete host compromise.
+5. Attacker is positioned to gain full read/write access to the Docker host filesystem.
 
 **PoC:** `autofyn_audit/exploits/09_privileged_sandbox_escape.py`
 ```
@@ -441,7 +439,7 @@ python autofyn_audit/exploits/09_privileged_sandbox_escape.py
 ```
 Expected output: `RESULT: CONFIRMED` — compose config confirms `privileged=true` and `docker.sock` mount; running `SecurePythonAnalyzer` on bypass payloads returns `is_safe=True`.
 
-**Note:** The `sandbox` Docker Compose profile is opt-in. Deployments that do not enable the sandbox profile are not affected by Part A. Part B (checker bypass) affects all deployments that use the sandbox code execution feature regardless of profile.
+**Note:** The `sandbox` Docker Compose profile is opt-in. Deployments that do not enable the sandbox profile are not affected by Part A. Part B (checker bypass) affects deployments that use the sandbox code execution feature. This is therefore best read as a deployment-contingent critical risk rather than a universally reachable default-web exploit.
 
 **Remediation:**
 
@@ -535,11 +533,11 @@ The `styledContent` transformation at lines 94-103 only performs CSS class name 
 
 A second unsanitized sink exists in `hooks.ts:148-151` where `useFetchDocx()` assigns mammoth output directly to `container.innerHTML`.
 
-Critically, **10 other components** in the same codebase use `DOMPurify.sanitize()` before `dangerouslySetInnerHTML` — including `markdown-content`, `next-markdown-content`, `chunk-card`, and `floating-chat-widget-markdown`. This proves the project is aware of the XSS pattern and deliberately applies DOMPurify elsewhere but missed this component.
+Critically, **10 other components** in the same codebase use `DOMPurify.sanitize()` before `dangerouslySetInnerHTML` — including `markdown-content`, `next-markdown-content`, `chunk-card`, and `floating-chat-widget-markdown`. This shows the project is already aware of the XSS risk pattern and applies DOMPurify elsewhere, but missed this component.
 
 **Attack Scenario:**
 
-1. Attacker crafts a malicious `.docx` file with embedded content that produces executable HTML through mammoth's conversion (e.g., hyperlinks with `javascript:` URIs, or content exploiting mammoth edge cases).
+1. Attacker crafts a malicious `.docx` file with embedded content that causes mammoth to emit unsafe HTML or unsafe links (for example, `javascript:` URIs or future/edge-case HTML output).
 2. Attacker uploads the DOCX to a knowledge base.
 3. Victim opens the document preview in their browser.
 4. The unsanitized HTML executes in the victim's browser context — stealing session tokens, performing actions as the victim, or exfiltrating data.
@@ -549,6 +547,8 @@ Critically, **10 other components** in the same codebase use `DOMPurify.sanitize
 python autofyn_audit/exploits/11_stored_xss_docx.py
 ```
 Expected output: `RESULT: CONFIRMED`
+
+**Note:** This finding is source-confirmed and high-confidence, but the audit did not include a full browser-driven end-to-end exploit against a live preview session. The confirmed issue is the unsanitized sink and unsafe HTML rendering path.
 
 **Remediation:**
 
@@ -577,7 +577,7 @@ Expected output: `RESULT: CONFIRMED`
 
 Two agent workflow components — `StringTransform` and `Message` — use Jinja2's `SandboxedEnvironment` to render user-authored templates server-side. Users with agent workflow edit access can provide arbitrary Jinja2 template strings that are rendered on the server.
 
-**Important context:** `SandboxedEnvironment` is Jinja2's **recommended mitigation** for rendering untrusted templates. The current Jinja2 3.1.6 `SandboxedEnvironment` blocks access to dunder attributes (`__init__`, `__globals__`) and all known bypass payloads tested during this audit were correctly blocked. **This finding is a defense-in-depth recommendation, not a currently exploitable vulnerability.**
+**Important context:** `SandboxedEnvironment` is Jinja2's **recommended mitigation** for rendering untrusted templates. The current Jinja2 3.1.6 `SandboxedEnvironment` blocks access to dunder attributes (`__init__`, `__globals__`) and all known bypass payloads tested during this audit were correctly blocked. **This finding is a defense-in-depth recommendation, not a currently exploitable vulnerability in the tested version.**
 
 The risk surface exists because:
 - The `SandboxedEnvironment` uses default configuration with no custom security policy or template variable allowlist.
@@ -658,7 +658,7 @@ Expected output: `RESULT: CONFIRMED (static analysis)` or `RESULT: CONFIRMED (dy
 
 **Description:**
 
-The ExeSQL tool builds ODBC (MSSQL) and CLI (DB2) connection strings by concatenating user-controlled configuration values (`host`, `database`, `username`, `password`) directly into semicolon-delimited connection strings. No sanitization removes or escapes semicolons in these values. An attacker with agent workflow edit access can inject additional ODBC/CLI key-value pairs by embedding semicolons in any connection parameter. This is distinct from Finding 10 (SQL query injection via `cursor.execute()`): this finding covers connection parameter injection that executes before any SQL query, targeting the ODBC driver layer.
+The ExeSQL tool builds ODBC (MSSQL) and CLI (DB2) connection strings by concatenating user-controlled configuration values (`host`, `database`, `username`, `password`) directly into semicolon-delimited connection strings. No sanitization removes or escapes semicolons in these values. An attacker with agent workflow edit access can inject additional ODBC/CLI key-value pairs by embedding semicolons in any connection parameter. This is distinct from Finding 10 (SQL query injection via `cursor.execute()`): this finding covers connection parameter injection that executes before any SQL query, targeting the driver/connection layer.
 
 **Attack Scenarios:**
 
@@ -674,6 +674,8 @@ PYTHONPATH=. python autofyn_audit/exploits/14_odbc_connstr_injection.py
 ```
 
 Expected output: `RESULT: CONFIRMED`
+
+**Note:** This finding is confirmed at the connection-string construction layer. The audit did not stand up attacker-controlled MSSQL or DB2 infrastructure to show credential capture end to end, so the demonstrated proof is at the exact string-building boundary rather than the full network interception stage.
 
 **Remediation:**
 
@@ -832,28 +834,28 @@ All 17 findings were confirmed through two independent verification phases:
 | 3 | Create JWT token, verify accepted without `max_age` | Confirmed — 2-second-old token accepted indefinitely |
 | 4 | Craft JSON with `subprocess.Popen`, trigger `from_dict_hook` | RCE confirmed — `id` command output captured |
 | 8 | AST parse + grep of `invoke.py` | Confirmed — zero SSRF guards, internal URLs pass unchanged |
-| 9 | YAML parse of compose + `SecurePythonAnalyzer` bypass | Confirmed — `privileged:true`, docker.sock mounted, `__builtins__["__import__"]("os")` passes as `is_safe=True` |
+| 9 | YAML parse of compose + `SecurePythonAnalyzer` bypass | Confirmed — privileged sandbox configuration and checker bypass are both present; host-compromise impact depends on sandbox deployment |
 | 10 | Regex bypass testing of DML filter | Confirmed — leading space, DROP TABLE, TRUNCATE all bypass filter |
-| 11 | Source analysis of `doc-preview.tsx` | Confirmed — `dangerouslySetInnerHTML` without DOMPurify; 10 other components use DOMPurify |
-| 12 | SandboxedEnvironment bypass testing | Confirmed — user templates rendered server-side; current bypasses blocked by Jinja2 3.1.6 |
-| 14 | Connection string injection simulation | Confirmed — semicolons in MSSQL/DB2 params inject ODBC keywords |
+| 11 | Source analysis of `doc-preview.tsx` | Confirmed — unsanitized `dangerouslySetInnerHTML` sink present; live browser execution not separately demonstrated |
+| 12 | SandboxedEnvironment bypass testing | Confirmed — user templates are rendered server-side; current tested bypasses are blocked by Jinja2 3.1.6 |
+| 14 | Connection string injection simulation | Confirmed — semicolons in MSSQL/DB2 params alter connection-string semantics before query execution |
 
 **Phase 2 — Live HTTP Tests (against running RAGFlow instance):**
 
 | Finding | HTTP Request | Server Response | Verdict |
 |---------|-------------|-----------------|---------|
-| 1 | Register user using committed RSA key | `code:0` — registration succeeded | Auth bypass via key compromise |
-| 5 | `GET /api/v1/documents/images/test-test` (no auth) | `code:100` (not 401) | Endpoint reached without auth |
-| 6 | `POST /api/v1/agents/fake-id/upload` (no auth) | `code:102` (not 401) | Endpoint reached without auth |
-| 7 | `GET /api/v1/agents/download?created_by=test&id=test` (no auth) | Non-401 response | Endpoint reached without auth |
-| 13 | `POST /api/v1/agents/fake-id/webhook` (no auth) | `code:400` (not 401) | Endpoint reached without auth |
-| 15 | `GET /api/v1/thumbnails?doc_ids=test` (no auth) | **`code:0, "success"`** | Data returned without any auth |
-| 16 | `PATCH /api/v1/users/me/models` with fake `tenant_id` (authed as different user) | **`code:0, "success"`** | Cross-tenant update succeeded |
-| 17 | `POST /api/v1/files/link-to-datasets` with fake `kb_ids` (authed as different user) | `code:102, "File not found"` | Request processed — no tenant ownership check |
+| 1 | Register user using committed RSA key | `code:0` — registration succeeded | Auth flow accepts ciphertext generated from repo-committed key material |
+| 5 | `GET /api/v1/documents/images/test-test` (no auth) | `code:100` (not 401) | Route reached without auth; no real image bytes were needed for this route-level proof |
+| 6 | `POST /api/v1/agents/<real_agent_id>/upload` (no auth) | **`code:0`**, file created under victim owner's ID | Real unauthenticated file write into victim-owned downloads bucket |
+| 7 | `GET /api/v1/agents/download?created_by=<victim>&id=<real_file_id>` (no auth) | `HTTP 200`, uploaded bytes returned | Real unauthenticated read of victim-owned agent file |
+| 13 | `POST /api/v1/agents/<real_agent_id>/webhook/test` (no auth) | `HTTP 200`, `{"message":"webhook-ran","success":true}` | Real unauthenticated webhook-triggered agent execution |
+| 15 | `GET /api/v1/thumbnails?doc_ids=<real_victim_doc_id>` (no auth) | **`code:0, "success"`** | Real victim document ID accepted without any auth |
+| 16 | Attacker `PATCH /api/v1/users/me/models` with victim `tenant_id` | **`code:0, "success"`**, victim `llm_id` changed | Real cross-tenant tenant-model mutation succeeded |
+| 17 | Attacker `POST /api/v1/files/link-to-datasets` with own file and victim dataset | **`code:0, "success"`**, injected doc appears in victim dataset listing | Real cross-tenant document injection succeeded |
 
-For findings 5–7, 13, 15: the comparison endpoint (`GET /api/v1/datasets`) correctly returns `code:401` when unauthenticated, proving auth enforcement works elsewhere but is missing on the vulnerable endpoints.
+For findings 5–7, 13, and 15, the comparison endpoint (`GET /api/v1/datasets`) correctly returned `code:401` when unauthenticated, proving auth enforcement works elsewhere but is missing on the vulnerable endpoints.
 
-For findings 16–17: authentication was obtained via the standard login flow (JWT from `Authorization` response header) — no special access or container shell required. The attacker path is: register → login → use JWT to hit IDOR/cross-tenant endpoints with another tenant's ID.
+For findings 16–17, authentication was obtained via the standard login flow (JWT from the `Authorization` response header) — no special access or container shell was required. The attacker path is: register → login → use JWT to hit IDOR/cross-tenant endpoints with another tenant's real ID.
 
 ---
 
@@ -887,7 +889,7 @@ bash autofyn_audit/teardown.sh
 
 `run_all.sh` executes two phases:
 - **Phase 1**: Runs all 17 standalone PoC scripts (findings 1–4 produce local RCE proof files; others perform static code analysis)
-- **Phase 2**: Runs `live_confirmation.py` which registers a user, obtains JWT auth, and confirms findings 5–7, 13, 15–17 via live HTTP requests
+- **Phase 2**: Runs `live_confirmation.py`, registers dedicated owner/attacker/victim users, and confirms findings 5–7, 13, 15–17 via live HTTP requests
 
 ### Manual — Standalone Exploits (no Docker needed)
 

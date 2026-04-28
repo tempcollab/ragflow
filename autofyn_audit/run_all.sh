@@ -20,6 +20,14 @@ EXPLOITS_DIR="$REPO_ROOT/autofyn_audit/exploits"
 export PYTHONPATH="$REPO_ROOT"
 
 API_URL="${RAGFLOW_API_URL:-http://localhost:9381}"
+if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+    PYTHON_BIN="$REPO_ROOT/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+else
+    echo "[!] Could not find a Python interpreter."
+    exit 1
+fi
 
 echo "============================================================"
 echo "  RAGFlow Security Audit — Full Exploit Suite"
@@ -27,6 +35,7 @@ echo "============================================================"
 echo ""
 echo "  Repo root  : $REPO_ROOT"
 echo "  PYTHONPATH  : $PYTHONPATH"
+echo "  Python      : $PYTHON_BIN"
 echo "  API URL     : $API_URL"
 echo "  Timestamp   : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 echo ""
@@ -46,7 +55,7 @@ run_exploit() {
     echo "  [$TOTAL/17] $name"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    OUTPUT=$(python3 "$script" $extra_args 2>&1)
+    OUTPUT=$("$PYTHON_BIN" "$script" $extra_args 2>&1)
     echo "$OUTPUT"
     if echo "$OUTPUT" | grep -q "RESULT: CONFIRMED"; then
         PASS=$((PASS + 1))
@@ -112,8 +121,8 @@ echo ""
 echo "  Testing against: $API_URL"
 echo ""
 
-if python3 -c "import requests; requests.get('$API_URL/api/v1/documents', timeout=5)" 2>/dev/null; then
-    python3 "$REPO_ROOT/autofyn_audit/live_confirmation.py" --url "$API_URL" 2>&1
+if "$PYTHON_BIN" -c "import requests; requests.get('$API_URL/api/v1/datasets', timeout=5)" 2>/dev/null; then
+    "$PYTHON_BIN" "$REPO_ROOT/autofyn_audit/live_confirmation.py" --url "$API_URL" 2>&1
     LIVE_EXIT=$?
 else
     echo "  [!] RAGFlow server not reachable at $API_URL"

