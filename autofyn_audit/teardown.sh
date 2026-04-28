@@ -3,11 +3,11 @@ set -euo pipefail
 
 NETWORK="ragflow-audit"
 CONTAINERS=(
+    "ragflow-audit-server"
     "ragflow-audit-mysql"
     "ragflow-audit-redis"
     "ragflow-audit-minio"
     "ragflow-audit-es"
-    "ragflow-audit-server"
 )
 
 echo "=== RAGFlow Audit Environment Teardown ==="
@@ -23,7 +23,6 @@ for container in "${CONTAINERS[@]}"; do
     fi
 done
 
-# Remove docker network
 if docker network inspect "$NETWORK" >/dev/null 2>&1; then
     docker network rm "$NETWORK"
     echo "[+] Removed network: $NETWORK"
@@ -32,10 +31,12 @@ else
 fi
 
 # Clean up temp files created by exploits
-if [ -f /tmp/pickle_rce_proof.txt ]; then
-    rm -f /tmp/pickle_rce_proof.txt
-    echo "[+] Removed /tmp/pickle_rce_proof.txt"
-fi
+for f in /tmp/pickle_rce_proof.txt /tmp/from_dict_hook_proof.txt; do
+    if [ -f "$f" ]; then
+        rm -f "$f"
+        echo "[+] Removed $f"
+    fi
+done
 
 echo ""
 echo "[+] Teardown complete."
