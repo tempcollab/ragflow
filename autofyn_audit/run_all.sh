@@ -70,6 +70,11 @@ run_exploit "$EXPLOITS_DIR/10_exesql_sqli.py"
 run_exploit "$EXPLOITS_DIR/11_stored_xss_docx.py"
 run_exploit "$EXPLOITS_DIR/12_jinja2_sandbox_bypass.py"
 
+# Exploits 13-15: mixed static + dynamic analysis
+run_exploit "$EXPLOITS_DIR/13_unauth_webhook_execution.py"
+run_exploit "$EXPLOITS_DIR/14_odbc_connstr_injection.py"
+run_exploit "$EXPLOITS_DIR/15_unauth_bulk_thumbnails.py"
+
 echo ""
 echo "============================================================"
 echo "  RESULTS: $PASS confirmed, $FAIL failed"

